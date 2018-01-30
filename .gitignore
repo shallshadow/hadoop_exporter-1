@@ -1,0 +1,4 @@
+venv/
+result
+*.pyc
+test.py

@@ -3,6 +3,7 @@
 import re
 import time
 import requests
+import urllib
 import argparse
 from pprint import pprint
 
@@ -18,6 +19,7 @@ DEBUG = int(os.environ.get('DEBUG', '0'))
 class NameNodeCollector(object):
     # The build statuses we want to export about.
     statuses = {
+        "up": "node status. 1:up, 0:down",
         "MissingBlocks": "MissingBlocks",
         "CapacityTotal": "CapacityTotal",
         # "CapacityTotalGB": "CapacityTotalGB",
@@ -56,26 +58,39 @@ class NameNodeCollector(object):
         # "usedSpace": "usedSpace", # same as used
     }
 
+    quota_statuses = {
+        "TotalFiles": "TotalFiles",
+        "RemainFiles": "RemainFiles",
+        "TotalSpace": "TotalSpace",
+        "RemainSpace": "RemainSpace",
+    }
+
     def __init__(self, target, cluster):
         self._cluster = cluster
-        self._target = target.rstrip("/")
+        self._targets = target.rstrip("/").split(';')
         self._prefix = 'hadoop_namenode_'
         self._datanode_prefix = 'hadoop_datanode_node_'
+        self._quota_prefix = 'hadoop_quota_'
 
     def collect(self):
-        # Request data from namenode jmx API
-        beans = self._request_data()
-
         self._setup_empty_prometheus_metrics()
+        # Request data from namenode jmx API
+        for url in self._targets:
+            self._target = url
+            beans = self._request_data()
+            self._get_metrics(beans)
 
-        self._get_metrics(beans)
+
+        self._load_quota()
 
         for status in self.statuses:
             yield self._prometheus_metrics[status]
 
         for status in self.datanode_statuses:
             yield self._prometheus_datanode_metrics[status]
-            
+
+        for status in self.quota_statuses:
+            yield self._prometheus_quota_metrics[status]
 
     def _request_data(self):
         # Request exactly the information we need from namenode
@@ -98,26 +113,36 @@ class NameNodeCollector(object):
         # The metrics we want to export.
         self._prometheus_metrics = {}
         self._prometheus_datanode_metrics = {}
+        self._prometheus_quota_metrics = {}
         for status in self.statuses:
             snake_case = re.sub('([a-z0-9])([A-Z])', r'\1_\2', status).lower()
             self._prometheus_metrics[status] = GaugeMetricFamily(self._prefix + snake_case,
-                                      self.statuses[status], labels=["cluster"])
-        
+                                      self.statuses[status], labels=["cluster", "nn_host", "nn_port"])
+
         for status in self.datanode_statuses:
             snake_case = re.sub('([a-z0-9])([A-Z])', r'\1_\2', status).lower()
             self._prometheus_datanode_metrics[status] = GaugeMetricFamily(self._datanode_prefix + snake_case,
-                        self.datanode_statuses[status], labels=["cluster", "host", "xferaddr"])
+                        self.datanode_statuses[status], labels=["cluster", "nn_host", "nn_port", "host", "xferaddr"])
+
+        for status in self.quota_statuses:
+            snake_case = re.sub('([a-z0-9])([A-Z])', r'\1_\2', status).lower()
+            self._prometheus_quota_metrics[status] = GaugeMetricFamily(self._quota_prefix + snake_case,
+                        self.quota_statuses[status], labels=["cluster", "dir"])
 
     def _get_metrics(self, beans):
+        nn_host, nn_port = split_host_port(self._target)
+        status = "up"
+        self._prometheus_metrics[status].add_metric([self._cluster, nn_host, nn_port], 0 if beans == [] else 1)
+
         for bean in beans:
             if bean['name'] == "Hadoop:service=NameNode,name=FSNamesystemState":
                 for status in self.statuses:
                     if bean.has_key(status):
-                        self._prometheus_metrics[status].add_metric([self._cluster], bean[status])
+                        self._prometheus_metrics[status].add_metric([self._cluster, nn_host, nn_port], bean[status])
             if bean['name'] == "Hadoop:service=NameNode,name=FSNamesystem":
                 for status in self.statuses:
                     if bean.has_key(status):
-                        self._prometheus_metrics[status].add_metric([self._cluster], bean[status])
+                        self._prometheus_metrics[status].add_metric([self._cluster, nn_host, nn_port], bean[status])
             elif bean['name'] == "Hadoop:service=NameNode,name=NameNodeInfo":
                 liveNodes = json.loads(bean['LiveNodes'])
                 deadNodes = json.loads(bean['DeadNodes'])
@@ -126,18 +151,40 @@ class NameNodeCollector(object):
                     node['up'] = 1
                     for status in self.datanode_statuses:
                         self._prometheus_datanode_metrics[status].add_metric(
-                            [self._cluster, host, node['xferaddr'] ], node[status])
+                            [self._cluster, nn_host, nn_port, host, node['xferaddr'] ], node[status])
                 for host in deadNodes:
                     node = deadNodes[host]
                     node['up'] = 0
                     for status in self.datanode_statuses:
                         if node.has_key(status):
                             self._prometheus_datanode_metrics[status].add_metric(
-                                [self._cluster, host, node['xferaddr'] ], node[status])
+                                [self._cluster, nn_host, nn_port, host, node['xferaddr'] ], node[status])
 
+    def _load_quota(self):
+        quota_file = 'result'
+        quota_dict = {}
+        with open(quota_file, 'r') as f:
+            for line in f.readlines():
+                tags = line.strip().split()
+                path = tags[len(tags) - 1]
+                quota_dict["TotalFiles"] = str2float(tags[0])
+                quota_dict["RemainFiles"] = str2float(tags[1])
+                quota_dict["TotalSpace"] = str2float(tags[2])
+                quota_dict["RemainSpace"] = str2float(tags[3])
+                for status in self.quota_statuses:
+                    self._prometheus_quota_metrics[self.quota_statuses[status]].add_metric(
+                        [self._cluster, path], quota_dict[status])
 
+def split_host_port(url):
+    protocol, s1 = urllib.splittype(url)
+    host, s2=  urllib.splithost(s1)
+    return urllib.splitport(host)
 
-
+def str2float(value):
+    try:
+        return float(value)
+    except:
+        return -1
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -180,12 +227,12 @@ def main():
         args = parse_args()
         port = int(args.port)
         REGISTRY.register(NameNodeCollector(args.url, args.cluster))
-        # REGISTRY.register(ResourceManagerNodeCollector(args.url, args.cluster))
-        
+
         start_http_server(port)
         print "Polling %s. Serving at port: %s" % (args.url, port)
         while True:
-            time.sleep(1)
+            os.system('bash quota_count.sh')
+            time.sleep(3600)
     except KeyboardInterrupt:
         print(" Interrupted")
         exit(0)

@@ -3,6 +3,7 @@
 import re
 import time
 import requests
+import urllib
 import argparse
 from pprint import pprint
 
@@ -17,6 +18,7 @@ DEBUG = int(os.environ.get('DEBUG', '0'))
 class ResourceManagerCollector(object):
     # The build statuses we want to export about.
     statuses = {
+        "up": "node status. 1:up, 0:down",
         "appsSubmitted": "The number of applications submitted",
         "appsCompleted": "The number of applications completed",
         "appsPending": "The number of applications pending",
@@ -44,16 +46,18 @@ class ResourceManagerCollector(object):
 
     def __init__(self, target, cluster):
         self._cluster = cluster
-        self._target = target.rstrip("/")
+        self._targets = target.rstrip("/").split(";")
         self._prefix = 'hadoop_resourcemanager_'
 
     def collect(self):
-        # Request data from resourcemanager API
-        clusterMetrics = self._request_data()
-
         self._setup_empty_prometheus_metrics()
 
-        self._get_metrics(clusterMetrics)
+        ## check ha
+        for url in self._targets:
+            self._target = url
+            # Request data from resourcemanager API
+            clusterMetrics = self._request_data()
+            self._get_metrics(clusterMetrics)
 
         for status in self.statuses:
             yield self._prometheus_metrics[status]
@@ -72,36 +76,6 @@ class ResourceManagerCollector(object):
 
             return result
 
-        '''
-        {
-        "clusterMetrics":{
-            "appsSubmitted": 74350,
-            "appsCompleted": 74322,
-            "appsPending": 0,
-            "appsRunning": 10,
-            "appsFailed": 2,
-            "appsKilled": 16,
-            "reservedMB": 515072,
-            "availableMB": 493568,
-            "allocatedMB": 2168832,
-            "reservedVirtualCores": 108,
-            "availableVirtualCores": 848,
-            "allocatedVirtualCores": 452,
-            "containersAllocated": 452,
-            "containersReserved": 108,
-            "containersPending": 53536,
-            "totalMB": 2662400,
-            "totalVirtualCores": 1300,
-            "totalNodes": 65,
-            "lostNodes": 0,
-            "unhealthyNodes": 0,
-            "decommissionedNodes": 0,
-            "rebootedNodes": 0,
-            "activeNodes": 65
-        }
-        }
-        '''
-
         return parsejobs(url)['clusterMetrics']
 
     def _setup_empty_prometheus_metrics(self):
@@ -110,11 +84,21 @@ class ResourceManagerCollector(object):
         for status in self.statuses:
             snake_case = re.sub('([a-z0-9])([A-Z])', r'\1_\2', status).lower()
             self._prometheus_metrics[status] = GaugeMetricFamily(self._prefix + snake_case,
-                                      self.statuses[status], labels=["cluster"])
+                                                                 self.statuses[status],
+                                                                 labels=["cluster", "rm_host", "rm_port"])
 
     def _get_metrics(self, clusterMetrics):
+        rm_host, rm_port = split_host_port(self._target)
+        status = "up"
+        if clusterMetrics == []:
+            self._prometheus_metrics[status].add_metric([self._cluster, rm_host, rm_port], 0)
+            return
+        else:
+            self._prometheus_metrics[status].add_metric([self._cluster, rm_host, rm_port], 1)
         for status in self.statuses:
-            self._prometheus_metrics[status].add_metric([self._cluster], clusterMetrics[status])
+            if status in clusterMetrics:
+                self._prometheus_metrics[status].add_metric(
+                    [self._cluster, rm_host, rm_port], clusterMetrics[status])
 
 
 class ResourceManagerNodeCollector(object):
@@ -129,27 +113,31 @@ class ResourceManagerNodeCollector(object):
     }
 
     NODE_STATE = {
-        'NEW': 1, 
-        'RUNNING': 2, 
-        'UNHEALTHY': 3, 
-        'DECOMMISSIONED': 4, 
-        'LOST': 5, 
+        'NEW': 1,
+        'RUNNING': 2,
+        'UNHEALTHY': 3,
+        'DECOMMISSIONED': 4,
+        'LOST': 5,
         'REBOOTED': 6,
+        'SHUTDOWN': 7,
     }
 
     def __init__(self, target, cluster):
         self._cluster = cluster
-        self._target = target.rstrip("/")
+        self._targets = target.rstrip("/").split(";")
         self._prefix = 'hadoop_resourcemanager_node_'
 
     def collect(self):
-        # Request data from resourcemanager API
-        nodeInfos = self._request_data()
-
         self._setup_empty_prometheus_metrics()
 
-        for nodeInfo in nodeInfos:
-            self._get_metrics(nodeInfo)
+        for url in self._targets:
+            self._target = url
+        # Request data from resourcemanager API
+            nodeInfos = self._request_data()
+
+
+            for nodeInfo in nodeInfos:
+                self._get_metrics(nodeInfo)
 
         for status in self.statuses:
             yield self._prometheus_metrics[status]
@@ -168,30 +156,6 @@ class ResourceManagerNodeCollector(object):
 
             return result['nodes']['node']
 
-        '''
-        {
-            "nodes":{
-                "node":[
-                    {
-                    "rack": "/default-rack",
-                    "state": "RUNNING",
-                    "id": "bc3.clicki.cn:21642",
-                    "nodeHostName": "bc3.clicki.cn",
-                    "nodeHTTPAddress": "bc3.clicki.cn:8042",
-                    "lastHealthUpdate": 1498805490510,
-                    "version": "2.5.2",
-                    "healthReport": "",
-                    "numContainers": 3,
-                    "usedMemoryMB": 6144,
-                    "availMemoryMB": 34816,
-                    "usedVirtualCores": 3,
-                    "availableVirtualCores": 17
-                    }
-                ]
-            }
-        }
-        '''
-
         return parsejobs(url)
 
     def _setup_empty_prometheus_metrics(self):
@@ -200,18 +164,23 @@ class ResourceManagerNodeCollector(object):
         for status in self.statuses:
             snake_case = re.sub('([a-z0-9])([A-Z])', r'\1_\2', status).lower()
             self._prometheus_metrics[status] = GaugeMetricFamily(self._prefix + snake_case,
-                                      self.statuses[status], labels=["cluster", "host", "version"])
+                                      self.statuses[status], labels=["cluster","rm_host", "rm_port", "host", "version"])
 
     def _get_metrics(self, nodeInfo):
+        rm_host, rm_port = split_host_port(self._target)
         for status in self.statuses:
             if status == 'state':
                 v = self.NODE_STATE[nodeInfo['state']]
             else:
                 v = nodeInfo[status]
             self._prometheus_metrics[status].add_metric(
-                [self._cluster, nodeInfo['nodeHostName'], nodeInfo['version']], v)
+                [self._cluster, rm_host, rm_port, nodeInfo['nodeHostName'], nodeInfo['version']], v)
 
 
+def split_host_port(url):
+    protocol, s1 = urllib.splittype(url)
+    host, s2=  urllib.splithost(s1)
+    return urllib.splitport(host)
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -255,7 +224,7 @@ def main():
         port = int(args.port)
         REGISTRY.register(ResourceManagerCollector(args.url, args.cluster))
         REGISTRY.register(ResourceManagerNodeCollector(args.url, args.cluster))
-        
+
         start_http_server(port)
         print "Polling %s. Serving at port: %s" % (args.url, port)
         while True:
